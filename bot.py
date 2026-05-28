@@ -266,7 +266,6 @@ def fire_alert(symbol: str, pct: float, open_p: float, close_p: float):
         daemon=True,
     ).start()
 
-
 # ─── WebSocket callbacks ──────────────────────────────────────────────────────
 
 def on_message(ws, raw_message):
@@ -277,12 +276,22 @@ def on_message(ws, raw_message):
         if data.get("e") != "kline":
             return
 
-        kline   = data["k"]
-        symbol  = kline["s"].lower()
-        open_p  = float(kline["o"])
-        close_p = float(kline["c"])   # live close, updates every tick
+        kline    = data["k"]
+        symbol   = kline["s"].lower()
+        open_p   = float(kline["o"])
+        close_p  = float(kline["c"])   # live close, updates every tick
+        is_final = kline["x"]          # True when candle is closed
 
         pct = candle_change_pct(open_p, close_p)
+
+        # Log every candle close that is above 7% so we can debug near-misses
+        if is_final and abs(pct) >= 7.0:
+            log.info(
+                "CANDLE CLOSE  %-12s  %.2f%%  open=%.6g  close=%.6g  %s",
+                kline["s"], pct, open_p, close_p,
+                "*** SHOULD HAVE ALERTED ***" if abs(pct) >= THRESHOLD_PCT else "(below threshold)"
+            )
+
         if abs(pct) >= THRESHOLD_PCT:
             fire_alert(symbol, pct, open_p, close_p)
 
@@ -347,6 +356,13 @@ def main():
 
     symbols = get_futures_symbols()
     chunks  = [symbols[i : i + CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
+
+    # Debug: confirm specific coins are tracked
+    for check in ["guausdt", "btcusdt", "ethusdt"]:
+        if check in symbols:
+            log.info("Tracking check: %s ✓", check.upper())
+        else:
+            log.warning("Tracking check: %s NOT FOUND in symbol list!", check.upper())
 
     # Start Telegram command polling (/test, /status)
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
