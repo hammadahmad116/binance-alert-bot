@@ -89,6 +89,9 @@ def get_futures_symbols() -> list[str]:
                 continue
             resp.raise_for_status()
             data = resp.json()
+            if not isinstance(data, dict) or "symbols" not in data:
+                log.warning("Host %s returned unexpected data, trying next…", host)
+                continue
             symbols = [
                 s["symbol"].lower()
                 for s in data["symbols"]
@@ -103,7 +106,29 @@ def get_futures_symbols() -> list[str]:
         except Exception as e:
             log.warning("Host %s failed: %s", host, e)
 
-    raise RuntimeError("All Binance REST hosts are blocked or unreachable from this server.")
+    # Last resort: use a public CORS proxy to reach Binance
+    log.warning("All direct hosts blocked. Trying public proxy fallback…")
+    try:
+        url  = "https://api.allorigins.win/raw?url=https://fapi.binance.com/fapi/v1/exchangeInfo"
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        symbols = [
+            s["symbol"].lower()
+            for s in data["symbols"]
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+            and s["contractType"] == "PERPETUAL"
+        ]
+        log.info("Connected via proxy — tracking %d USDT perpetual futures pairs", len(symbols))
+        return symbols
+    except Exception as e:
+        log.warning("Proxy fallback failed: %s", e)
+
+    raise RuntimeError(
+        "All Binance REST hosts are blocked. "
+        "Please change Railway region to Europe West in Settings tab."
+    )
 
 
 def candle_change_pct(open_price: float, close_price: float) -> float:
