@@ -1,0 +1,20 @@
+2026-05-28 09:43:06  INFO     ==================================================
+2026-05-28 09:43:06  INFO     Binance Futures 10%% Candle Alert Bot
+2026-05-28 09:43:06  INFO     Market    : USD-M Perpetual Futures
+2026-05-28 09:43:06  INFO     Interval  : 15m
+2026-05-28 09:43:06  INFO     Threshold : 10.0%
+2026-05-28 09:43:06  INFO     Cooldown  : 900s
+2026-05-28 09:43:06  INFO     Telegram  : NOT configured
+2026-05-28 09:43:06  INFO     ==================================================
+2026-05-28 09:43:06  WARNING  TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set in .env — you will NOT receive mobile alerts!
+2026-05-28 09:43:06  INFO     Tracking 527 USDT perpetual futures pairs
+2026-05-28 09:43:06  INFO     WS chunk #1: 200 symbols
+2026-05-28 09:43:07  INFO     WS chunk #2: 200 symbols
+2026-05-28 09:43:07  INFO     Websocket connected
+2026-05-28 09:43:07  INFO     WebSocket connected.
+2026-05-28 09:43:07  INFO     WS chunk #3: 127 symbols
+2026-05-28 09:43:07  INFO     Websocket connected
+2026-05-28 09:43:07  INFO     WebSocket connected.
+2026-05-28 09:43:08  INFO     3 WebSocket connection(s) running. Ctrl+C to stop.
+2026-05-28 09:43:08  INFO     Websocket connected
+2026-05-28 09:43:08  INFO     WebSocket connected.
