@@ -304,6 +304,13 @@ def poll_telegram_commands(total_symbols: int):
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
+def refresh_symbols_periodically(interval_hours: int = 6):
+    """Restart the process every N hours so new Binance pairs are picked up."""
+    time.sleep(interval_hours * 3600)
+    log.info("Scheduled restart to refresh symbol list…")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def main():
     log.info("=" * 50)
     log.info("Binance Futures 10%% Candle Alert Bot")
@@ -319,6 +326,9 @@ def main():
     symbols = get_futures_symbols()
     chunks  = [symbols[i : i + CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
     log.info("Monitoring %d symbols across %d WebSocket connections", len(symbols), len(chunks))
+
+    # Auto-restart every 6 hours to pick up any new Binance pairs
+    threading.Thread(target=refresh_symbols_periodically, daemon=True).start()
 
     # Start Telegram command listener
     threading.Thread(
