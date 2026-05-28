@@ -52,6 +52,15 @@ KLINE_INTERVAL  = os.getenv("KLINE_INTERVAL", "15m")          # candle timeframe
 BINANCE_REST    = "https://fapi.binance.com"                   # USD-M Futures REST
 BINANCE_WS_BASE = "wss://fstream.binance.com"                  # USD-M Futures WS
 
+# Alternative REST hosts — tried in order if the primary is geo-blocked
+BINANCE_REST_HOSTS = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
+]
+
 # Telegram — required for mobile notifications
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -70,20 +79,31 @@ alert_lock = threading.Lock()
 # ─── Binance helpers ──────────────────────────────────────────────────────────
 
 def get_futures_symbols() -> list[str]:
-    """Fetch all active USDT perpetual futures pairs from Binance."""
-    url = f"{BINANCE_REST}/fapi/v1/exchangeInfo"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    symbols = [
-        s["symbol"].lower()
-        for s in data["symbols"]
-        if s["quoteAsset"] == "USDT"
-        and s["status"] == "TRADING"
-        and s["contractType"] == "PERPETUAL"
-    ]
-    log.info("Tracking %d USDT perpetual futures pairs", len(symbols))
-    return symbols
+    """Fetch all active USDT perpetual futures pairs, trying multiple hosts."""
+    for host in BINANCE_REST_HOSTS:
+        try:
+            url  = f"{host}/fapi/v1/exchangeInfo"
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 451:
+                log.warning("Host %s returned 451 (geo-blocked), trying next…", host)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            symbols = [
+                s["symbol"].lower()
+                for s in data["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+                and s["contractType"] == "PERPETUAL"
+            ]
+            log.info("Connected via %s — tracking %d USDT perpetual futures pairs", host, len(symbols))
+            global BINANCE_REST
+            BINANCE_REST = host
+            return symbols
+        except Exception as e:
+            log.warning("Host %s failed: %s", host, e)
+
+    raise RuntimeError("All Binance REST hosts are blocked or unreachable from this server.")
 
 
 def candle_change_pct(open_price: float, close_price: float) -> float:
