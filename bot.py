@@ -172,7 +172,78 @@ def send_telegram(symbol: str, pct: float, open_p: float, close_p: float):
         log.warning("Telegram send failed: %s", e)
 
 
-# ─── Alert dispatcher ─────────────────────────────────────────────────────────
+# ─── Telegram command polling (/test) ────────────────────────────────────────
+
+def send_raw_telegram(text: str, chat_id: str = None):
+    """Send a plain message to Telegram."""
+    if not TELEGRAM_TOKEN:
+        return
+    cid = chat_id or TELEGRAM_CHAT_ID
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(
+            url,
+            json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+            timeout=8,
+        )
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
+
+
+def poll_telegram_commands():
+    """
+    Long-poll Telegram for incoming messages.
+    Responds to /test with a fake alert so the user can verify the bot works.
+    """
+    if not TELEGRAM_TOKEN:
+        return
+
+    offset = 0
+    log.info("Telegram command polling started. Send /test to @memristor_bot to test.")
+
+    while True:
+        try:
+            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            resp = requests.get(url, params={"timeout": 30, "offset": offset}, timeout=35)
+            if not resp.ok:
+                time.sleep(5)
+                continue
+
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg  = update.get("message", {})
+                text = msg.get("text", "").strip().lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if text == "/test":
+                    log.info("Received /test command from chat %s", chat_id)
+                    send_raw_telegram(
+                        "✅ *Bot is working!*\n\n"
+                        "Here is what a real alert looks like:\n\n"
+                        "🚀 PUMP\n"
+                        "*BTCUSDT* moved *12.45%* in 15m\n"
+                        "Open: `95000` → Now: `106832`\n"
+                        "⏰ 10:25:00 UTC\n\n"
+                        "_You will receive alerts like this automatically when any futures coin moves 10%+ in 15 minutes._",
+                        chat_id=chat_id,
+                    )
+                elif text == "/status":
+                    send_raw_telegram(
+                        "📡 *Bot Status*\n"
+                        f"• Monitoring: 527 USDT futures pairs\n"
+                        f"• Threshold: {THRESHOLD_PCT}%\n"
+                        f"• Interval: {KLINE_INTERVAL}\n"
+                        f"• Running on: EU West (Amsterdam)\n"
+                        "• Status: ✅ Online",
+                        chat_id=chat_id,
+                    )
+
+        except Exception as e:
+            log.warning("Telegram polling error: %s", e)
+            time.sleep(5)
+
+
 
 def fire_alert(symbol: str, pct: float, open_p: float, close_p: float):
     """Deduplicate and dispatch alert to all channels."""
@@ -276,6 +347,9 @@ def main():
 
     symbols = get_futures_symbols()
     chunks  = [symbols[i : i + CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
+
+    # Start Telegram command polling (/test, /status)
+    threading.Thread(target=poll_telegram_commands, daemon=True).start()
 
     for idx, chunk in enumerate(chunks):
         t = threading.Thread(
