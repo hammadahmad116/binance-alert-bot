@@ -4,12 +4,14 @@ Binance Futures 10% Candle Alert Bot
 Monitors ALL Binance USD-M Perpetual Futures pairs for 15-minute candles
 that move 10%+ (open → current price, tick by tick).
 
-Notifications:
-  - Telegram message to your phone (primary — works 24/7 on mobile)
-  - Console + log file
+Key logic:
+  - Alert fires as soon as price crosses 10% from candle open (not just at close)
+  - One alert per symbol per candle (deduped by candle open timestamp)
+  - Covers every coin — no hardcoded symbols
 
-Runs on any server/cloud (Railway, Oracle Free, VPS, etc.)
-No Windows dependencies.
+Notifications:
+  - Telegram message to your phone
+  - Console + log file
 
 Usage:
   pip install -r requirements.txt
@@ -30,7 +32,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── Logging setup ────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 
@@ -47,12 +49,10 @@ log = logging.getLogger("binance-alert")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-THRESHOLD_PCT   = float(os.getenv("THRESHOLD_PCT", "10.0"))   # % move to alert
-KLINE_INTERVAL  = os.getenv("KLINE_INTERVAL", "15m")          # candle timeframe
-BINANCE_REST    = "https://fapi.binance.com"                   # USD-M Futures REST
-BINANCE_WS_BASE = "wss://fstream.binance.com"                  # USD-M Futures WS
+THRESHOLD_PCT   = float(os.getenv("THRESHOLD_PCT", "10.0"))
+KLINE_INTERVAL  = os.getenv("KLINE_INTERVAL", "15m")
+BINANCE_WS_BASE = "wss://fstream.binance.com"
 
-# Alternative REST hosts — tried in order if the primary is geo-blocked
 BINANCE_REST_HOSTS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
@@ -61,22 +61,20 @@ BINANCE_REST_HOSTS = [
     "https://fapi4.binance.com",
 ]
 
-# Telegram — required for mobile notifications
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Suppress repeat alerts for the same symbol (seconds)
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", str(60 * 15)))  # 15 min default
-
-# Max symbols per WebSocket connection (Binance allows up to 1024)
 CHUNK_SIZE = 200
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
-last_alert: dict[str, float] = {}
-alert_lock = threading.Lock()
+# Key: symbol, Value: candle open timestamp (ms) of the last alert fired
+# This ensures exactly ONE alert per symbol per candle, no matter how many
+# ticks cross the threshold during that candle.
+alerted_candles: dict[str, int] = {}
+state_lock = threading.Lock()
 
-# ─── Binance helpers ──────────────────────────────────────────────────────────
+# ─── Binance symbol fetch ─────────────────────────────────────────────────────
 
 def get_futures_symbols() -> list[str]:
     """Fetch all active USDT perpetual futures pairs, trying multiple hosts."""
@@ -85,12 +83,12 @@ def get_futures_symbols() -> list[str]:
             url  = f"{host}/fapi/v1/exchangeInfo"
             resp = requests.get(url, timeout=15)
             if resp.status_code == 451:
-                log.warning("Host %s returned 451 (geo-blocked), trying next…", host)
+                log.warning("Host %s geo-blocked (451), trying next…", host)
                 continue
             resp.raise_for_status()
             data = resp.json()
             if not isinstance(data, dict) or "symbols" not in data:
-                log.warning("Host %s returned unexpected data, trying next…", host)
+                log.warning("Host %s bad response, trying next…", host)
                 continue
             symbols = [
                 s["symbol"].lower()
@@ -99,18 +97,16 @@ def get_futures_symbols() -> list[str]:
                 and s["status"] == "TRADING"
                 and s["contractType"] == "PERPETUAL"
             ]
-            log.info("Connected via %s — tracking %d USDT perpetual futures pairs", host, len(symbols))
-            global BINANCE_REST
-            BINANCE_REST = host
+            log.info("Fetched %d USDT perpetual pairs via %s", len(symbols), host)
             return symbols
         except Exception as e:
-            log.warning("Host %s failed: %s", host, e)
+            log.warning("Host %s error: %s", host, e)
 
-    # Last resort: use a public CORS proxy to reach Binance
-    log.warning("All direct hosts blocked. Trying public proxy fallback…")
+    # Proxy fallback
+    log.warning("All direct hosts blocked — trying proxy…")
     try:
         url  = "https://api.allorigins.win/raw?url=https://fapi.binance.com/fapi/v1/exchangeInfo"
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(url, timeout=25)
         resp.raise_for_status()
         data = resp.json()
         symbols = [
@@ -120,138 +116,56 @@ def get_futures_symbols() -> list[str]:
             and s["status"] == "TRADING"
             and s["contractType"] == "PERPETUAL"
         ]
-        log.info("Connected via proxy — tracking %d USDT perpetual futures pairs", len(symbols))
+        log.info("Fetched %d USDT perpetual pairs via proxy", len(symbols))
         return symbols
     except Exception as e:
-        log.warning("Proxy fallback failed: %s", e)
+        log.warning("Proxy failed: %s", e)
 
-    raise RuntimeError(
-        "All Binance REST hosts are blocked. "
-        "Please change Railway region to Europe West in Settings tab."
-    )
+    raise RuntimeError("Cannot reach Binance REST API from this server.")
 
 
-def candle_change_pct(open_price: float, close_price: float) -> float:
-    if open_price == 0:
-        return 0.0
-    return ((close_price - open_price) / open_price) * 100
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
-
-# ─── Notification channels ────────────────────────────────────────────────────
-
-def send_telegram(symbol: str, pct: float, open_p: float, close_p: float):
-    """Send alert to Telegram. This is the primary mobile notification."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — skipping mobile notification")
-        return
-
-    direction = "🚀 PUMP" if pct > 0 else "💥 DUMP"
-    now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
-    text = (
-        f"{direction}\n"
-        f"*{symbol.upper()}* moved *{abs(pct):.2f}%* in 15m\n"
-        f"Open: `{open_p:.6g}` → Now: `{close_p:.6g}`\n"
-        f"⏰ {now_utc}"
-    )
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "Markdown",
-            },
-            timeout=8,
-        )
-        if not r.ok:
-            log.warning("Telegram API error: %s", r.text)
-    except Exception as e:
-        log.warning("Telegram send failed: %s", e)
-
-
-# ─── Telegram command polling (/test) ────────────────────────────────────────
-
-def send_raw_telegram(text: str, chat_id: str = None):
-    """Send a plain message to Telegram."""
+def send_telegram(text: str, chat_id: str = None):
     if not TELEGRAM_TOKEN:
         return
     cid = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(
+        r = requests.post(
             url,
             json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
             timeout=8,
         )
+        if not r.ok:
+            log.warning("Telegram error: %s", r.text)
     except Exception as e:
         log.warning("Telegram send failed: %s", e)
 
 
-def poll_telegram_commands():
+def send_alert_telegram(symbol: str, pct: float, open_p: float, close_p: float):
+    direction = "🚀 PUMP" if pct > 0 else "💥 DUMP"
+    now_utc   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    text = (
+        f"{direction}\n"
+        f"*{symbol.upper()}* moved *{abs(pct):.2f}%* in {KLINE_INTERVAL}\n"
+        f"Open: `{open_p:.6g}` → Now: `{close_p:.6g}`\n"
+        f"⏰ {now_utc}"
+    )
+    send_telegram(text)
+
+
+# ─── Alert dispatcher ─────────────────────────────────────────────────────────
+
+def fire_alert(symbol: str, candle_open_ts: int, pct: float, open_p: float, close_p: float):
     """
-    Long-poll Telegram for incoming messages.
-    Responds to /test with a fake alert so the user can verify the bot works.
+    Fire alert for this symbol only if we haven't already alerted
+    for this exact candle (identified by its open timestamp).
     """
-    if not TELEGRAM_TOKEN:
-        return
-
-    offset = 0
-    log.info("Telegram command polling started. Send /test to @memristor_bot to test.")
-
-    while True:
-        try:
-            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            resp = requests.get(url, params={"timeout": 30, "offset": offset}, timeout=35)
-            if not resp.ok:
-                time.sleep(5)
-                continue
-
-            updates = resp.json().get("result", [])
-            for update in updates:
-                offset = update["update_id"] + 1
-                msg  = update.get("message", {})
-                text = msg.get("text", "").strip().lower()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                if text == "/test":
-                    log.info("Received /test command from chat %s", chat_id)
-                    send_raw_telegram(
-                        "✅ *Bot is working!*\n\n"
-                        "Here is what a real alert looks like:\n\n"
-                        "🚀 PUMP\n"
-                        "*BTCUSDT* moved *12.45%* in 15m\n"
-                        "Open: `95000` → Now: `106832`\n"
-                        "⏰ 10:25:00 UTC\n\n"
-                        "_You will receive alerts like this automatically when any futures coin moves 10%+ in 15 minutes._",
-                        chat_id=chat_id,
-                    )
-                elif text == "/status":
-                    send_raw_telegram(
-                        "📡 *Bot Status*\n"
-                        f"• Monitoring: 527 USDT futures pairs\n"
-                        f"• Threshold: {THRESHOLD_PCT}%\n"
-                        f"• Interval: {KLINE_INTERVAL}\n"
-                        f"• Running on: EU West (Amsterdam)\n"
-                        "• Status: ✅ Online",
-                        chat_id=chat_id,
-                    )
-
-        except Exception as e:
-            log.warning("Telegram polling error: %s", e)
-            time.sleep(5)
-
-
-
-def fire_alert(symbol: str, pct: float, open_p: float, close_p: float):
-    """Deduplicate and dispatch alert to all channels."""
-    now = time.time()
-    with alert_lock:
-        if now - last_alert.get(symbol, 0) < ALERT_COOLDOWN:
-            return  # Still in cooldown for this symbol
-        last_alert[symbol] = now
+    with state_lock:
+        if alerted_candles.get(symbol) == candle_open_ts:
+            return  # Already alerted for this candle
+        alerted_candles[symbol] = candle_open_ts
 
     direction = "PUMP 🚀" if pct > 0 else "DUMP 💥"
     log.info(
@@ -259,41 +173,44 @@ def fire_alert(symbol: str, pct: float, open_p: float, close_p: float):
         symbol.upper(), direction, abs(pct), open_p, close_p,
     )
 
-    # Send Telegram in a background thread so it never blocks the WS loop
     threading.Thread(
-        target=send_telegram,
+        target=send_alert_telegram,
         args=(symbol, pct, open_p, close_p),
         daemon=True,
     ).start()
 
-# ─── WebSocket callbacks ──────────────────────────────────────────────────────
+
+# ─── WebSocket ────────────────────────────────────────────────────────────────
 
 def on_message(ws, raw_message):
     try:
         msg  = json.loads(raw_message)
-        data = msg.get("data", msg)   # combined stream wraps under "data"
+        data = msg.get("data", msg)
 
         if data.get("e") != "kline":
             return
 
-        kline    = data["k"]
-        symbol   = kline["s"].lower()
-        open_p   = float(kline["o"])
-        close_p  = float(kline["c"])   # live close, updates every tick
-        is_final = kline["x"]          # True when candle is closed
+        kline          = data["k"]
+        symbol         = kline["s"].lower()
+        candle_open_ts = int(kline["t"])       # candle open time in ms — unique per candle
+        open_p         = float(kline["o"])
+        close_p        = float(kline["c"])
+        is_closed      = kline["x"]            # True on final tick of candle
 
-        pct = candle_change_pct(open_p, close_p)
+        if open_p == 0:
+            return
 
-        # Log every candle close that is above 7% so we can debug near-misses
-        if is_final and abs(pct) >= 7.0:
+        pct = ((close_p - open_p) / open_p) * 100
+
+        # Log any candle that closes above 7% for visibility
+        if is_closed and abs(pct) >= 7.0:
             log.info(
-                "CANDLE CLOSE  %-12s  %.2f%%  open=%.6g  close=%.6g  %s",
+                "CANDLE CLOSED  %-12s  %.2f%%  open=%.6g  close=%.6g",
                 kline["s"], pct, open_p, close_p,
-                "*** SHOULD HAVE ALERTED ***" if abs(pct) >= THRESHOLD_PCT else "(below threshold)"
             )
 
         if abs(pct) >= THRESHOLD_PCT:
-            fire_alert(symbol, pct, open_p, close_p)
+            fire_alert(symbol, candle_open_ts, pct, open_p, close_p)
 
     except Exception as e:
         log.error("on_message error: %s", e)
@@ -304,7 +221,7 @@ def on_error(ws, error):
 
 
 def on_close(ws, code, msg):
-    log.warning("WebSocket closed (%s). Will reconnect…", code)
+    log.warning("WebSocket closed (%s). Reconnecting…", code)
 
 
 def on_open(ws):
@@ -319,10 +236,8 @@ def build_stream_url(symbols: list[str]) -> str:
 
 
 def run_ws_chunk(symbols: list[str], chunk_id: int):
-    """Run one WebSocket connection for a chunk of symbols, auto-reconnecting."""
     url = build_stream_url(symbols)
-    log.info("WS chunk #%d: %d symbols", chunk_id, len(symbols))
-
+    log.info("WS chunk #%d started: %d symbols", chunk_id, len(symbols))
     while True:
         ws = websocket.WebSocketApp(
             url,
@@ -336,6 +251,57 @@ def run_ws_chunk(symbols: list[str], chunk_id: int):
         time.sleep(5)
 
 
+# ─── Telegram command polling ─────────────────────────────────────────────────
+
+def poll_telegram_commands(total_symbols: int):
+    if not TELEGRAM_TOKEN:
+        return
+
+    offset = 0
+    log.info("Telegram polling started. Send /test or /status to @memristor_bot")
+
+    while True:
+        try:
+            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            resp = requests.get(url, params={"timeout": 30, "offset": offset}, timeout=35)
+            if not resp.ok:
+                time.sleep(5)
+                continue
+
+            for update in resp.json().get("result", []):
+                offset  = update["update_id"] + 1
+                msg     = update.get("message", {})
+                text    = msg.get("text", "").strip().lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if text == "/test":
+                    log.info("/test from %s", chat_id)
+                    send_telegram(
+                        "✅ *Bot is working\\!*\n\n"
+                        "Example alert:\n\n"
+                        "🚀 PUMP\n"
+                        "*BTCUSDT* moved *12\\.45%* in 15m\n"
+                        "Open: `95000` → Now: `106832`\n"
+                        "⏰ 10:25:00 UTC\n\n"
+                        "_Real alerts fire automatically when any coin moves 10%\\+ in a 15m candle\\._",
+                        chat_id=chat_id,
+                    )
+                elif text == "/status":
+                    send_telegram(
+                        f"📡 *Bot Status*\n"
+                        f"• Pairs monitored: {total_symbols}\n"
+                        f"• Threshold: {THRESHOLD_PCT}%\n"
+                        f"• Interval: {KLINE_INTERVAL}\n"
+                        f"• Server: EU West \\(Amsterdam\\)\n"
+                        f"• Status: ✅ Online",
+                        chat_id=chat_id,
+                    )
+
+        except Exception as e:
+            log.warning("Telegram polling error: %s", e)
+            time.sleep(5)
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
@@ -344,45 +310,39 @@ def main():
     log.info("Market    : USD-M Perpetual Futures")
     log.info("Interval  : %s", KLINE_INTERVAL)
     log.info("Threshold : %.1f%%", THRESHOLD_PCT)
-    log.info("Cooldown  : %ds", ALERT_COOLDOWN)
     log.info("Telegram  : %s", "enabled" if TELEGRAM_TOKEN else "NOT configured")
     log.info("=" * 50)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning(
-            "TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set in .env — "
-            "you will NOT receive mobile alerts!"
-        )
+        log.warning("Telegram credentials missing — no mobile alerts will be sent!")
 
     symbols = get_futures_symbols()
     chunks  = [symbols[i : i + CHUNK_SIZE] for i in range(0, len(symbols), CHUNK_SIZE)]
+    log.info("Monitoring %d symbols across %d WebSocket connections", len(symbols), len(chunks))
 
-    # Debug: confirm specific coins are tracked
-    for check in ["guausdt", "btcusdt", "ethusdt"]:
-        if check in symbols:
-            log.info("Tracking check: %s ✓", check.upper())
-        else:
-            log.warning("Tracking check: %s NOT FOUND in symbol list!", check.upper())
+    # Start Telegram command listener
+    threading.Thread(
+        target=poll_telegram_commands,
+        args=(len(symbols),),
+        daemon=True,
+    ).start()
 
-    # Start Telegram command polling (/test, /status)
-    threading.Thread(target=poll_telegram_commands, daemon=True).start()
-
+    # Start one WebSocket thread per chunk
     for idx, chunk in enumerate(chunks):
-        t = threading.Thread(
+        threading.Thread(
             target=run_ws_chunk,
             args=(chunk, idx + 1),
             daemon=True,
-        )
-        t.start()
-        time.sleep(0.5)   # stagger connections slightly
+        ).start()
+        time.sleep(0.5)
 
-    log.info("%d WebSocket connection(s) running. Ctrl+C to stop.", len(chunks))
+    log.info("All streams running. Waiting for alerts…")
 
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        log.info("Stopped by user.")
+        log.info("Stopped.")
 
 
 if __name__ == "__main__":
